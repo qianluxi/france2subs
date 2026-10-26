@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# 运行产物
+.france2subs_work/
+*.srt
+*.vtt
+*.transcript.json
+*.wav
+
+# 但保留仓库里可能自带的示例字幕（如需示例可自行放开）
+!examples/*.srt
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

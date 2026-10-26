@@ -1,0 +1,17 @@
+# 统一换行符，避免 Windows 批处理在各平台被改写
+* text=auto
+
+# 批处理必须是 CRLF，否则 cmd 无法正确解析（会闪退）
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Python / Markdown 用 LF
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+
+# 二进制
+*.png binary
+*.jpg binary
+*.ico binary
+*.exe binary
