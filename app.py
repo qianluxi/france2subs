@@ -6,6 +6,7 @@ france2subs 图形界面
 产出视频 + 法语/中文/中法双语字幕，与视频同目录。
 """
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -17,10 +18,22 @@ HERE = Path(__file__).resolve().parent
 ENGINE = HERE / "france2subs.py"
 
 
+def _engine_version():
+    try:
+        m = re.search(r'__version__\s*=\s*"([^"]+)"', ENGINE.read_text(encoding="utf-8"))
+        return m.group(1) if m else ""
+    except OSError:
+        return ""
+
+
+VERSION = _engine_version()
+
+
 class App:
     def __init__(self, root):
         self.root = root
-        root.title("france2subs — 下载 france.tv 视频并配字幕")
+        suffix = f"  v{VERSION}" if VERSION else ""
+        root.title(f"france2subs — 下载 france.tv 视频并配字幕{suffix}")
         root.geometry("760x560")
         root.minsize(640, 480)
 

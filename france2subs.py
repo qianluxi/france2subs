@@ -23,11 +23,14 @@ import argparse
 import json
 import os
 import re
+import statistics
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
+
+__version__ = "1.1.0"
+TRANSCRIPT_SCHEMA = 2   # 2 = 已处理音轨断口（见「时间轴对齐」一节）
 
 # ----------------------------------------------------------------------------
 # 路径与工具定位
@@ -97,12 +100,177 @@ def download_video(url, out_dir, max_height=1080):
 # 步骤 2：转写（faster-whisper）
 # ----------------------------------------------------------------------------
 
+# ==== 时间轴对齐 ============================================================
+# 背景：HLS 合流、录制中断、分段时间戳重置都会让音轨的 PTS 出现「跳空」，
+# 例如本片在 13:52 处 PTS 从 831.979 直接跳到 840.000，中间 8 秒没有音频包。
+# 如果直接 `ffmpeg -i video -f s16le -` 解码，输出的是「连续、无空洞」的 PCM，
+# 那 8 秒会被压缩掉 —— 于是 14:00 之后的每一句字幕都提前 8 秒，越往后越错。
+#
+# 解决：解码时用 aresample=async=1 按容器 PTS 补齐静音，保证
+#         PCM 时间轴 == 容器时间轴 == 播放器时间轴。
+# 另外对旧版缓存（v1 未对齐）提供纯数学换算，避免用户白白重跑识别。
+# ============================================================================
+
+def _ffmpeg_bin():
+    return (Path(FFMPEG_DIR) / "ffmpeg.exe") if FFMPEG_DIR else "ffmpeg"
+
+
+def _ffprobe_bin():
+    return (Path(FFMPEG_DIR) / "ffprobe.exe") if FFMPEG_DIR else "ffprobe"
+
+
+def probe_media(video_path):
+    """读取容器总时长与音轨时长（秒）。读不到就返回 None 字段。"""
+    out = {"duration": None, "audio_duration": None}
+    try:
+        p = subprocess.run(
+            [str(_ffprobe_bin()), "-v", "error",
+             "-show_entries", "format=duration:stream=codec_type,duration",
+             "-of", "json", str(video_path)],
+            capture_output=True, text=True, check=True)
+        d = json.loads(p.stdout or "{}")
+        dur = (d.get("format") or {}).get("duration")
+        if dur not in (None, "N/A"):
+            out["duration"] = float(dur)
+        for st in d.get("streams") or []:
+            if st.get("codec_type") == "audio":
+                a = st.get("duration")
+                if a not in (None, "N/A"):
+                    out["audio_duration"] = float(a)
+                break
+    except Exception as e:
+        print(f"  [对齐] 读取容器信息失败（跳过检查）：{e}", flush=True)
+    return out
+
+
+def find_audio_gaps(video_path, min_missing=0.25):
+    """找出音轨里 PTS 跳空的位置。
+
+    返回 [(gap_start, gap_end, missing_seconds), ...]，时间为容器时间轴。
+    """
+    try:
+        p = subprocess.run(
+            [str(_ffprobe_bin()), "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "packet=pts_time", "-of", "csv=p=0", str(video_path)],
+            capture_output=True, text=True, check=True)
+    except Exception:
+        return []
+
+    pts = []
+    for line in p.stdout.splitlines():
+        line = line.strip().rstrip(",")
+        if not line:
+            continue
+        try:
+            pts.append(float(line))
+        except ValueError:
+            pass
+    if len(pts) < 3:
+        return []
+
+    pts.sort()
+    deltas = [b - a for a, b in zip(pts, pts[1:]) if b - a > 0]
+    if not deltas:
+        return []
+    nominal = statistics.median(deltas)          # 正常包间隔（44.1k/48k 下约 0.021s）
+    threshold = max(0.12, nominal * 3)
+
+    gaps = []
+    for a, b in zip(pts, pts[1:]):
+        d = b - a
+        if d > threshold:
+            missing = d - nominal
+            if missing >= min_missing:
+                gaps.append((round(a, 3), round(b, 3), round(missing, 3)))
+    return gaps
+
+
+def remap_timeline(rows, gaps):
+    """把「无空洞的压缩时间轴」上的时间戳换算到容器时间轴。
+
+    用于修复旧版（v1）产生的转写缓存：那版解码没补静音，所有断口之后的时间戳
+    都偏早了「累计缺失秒数」。这里按断口位置做分段平移，纯数学、不重跑识别。
+    """
+    if not gaps:
+        return rows
+
+    # 每个断口在「压缩轴」上的位置 = 容器位置 - 它之前已经压缩掉的秒数
+    pivots = []
+    cum = 0.0
+    for gap_start, _gap_end, missing in sorted(gaps):
+        pivots.append((gap_start - cum, cum + missing))
+        cum += missing
+
+    def conv(t):
+        shift = 0.0
+        for pos, after in pivots:
+            if t >= pos:
+                shift = after
+            else:
+                break
+        return t + shift
+
+    out = []
+    for seg in rows:
+        seg = dict(seg)
+        seg["start"] = round(conv(seg["start"]), 3)
+        seg["end"] = round(conv(seg["end"]), 3)
+        seg["words"] = [dict(w, s=round(conv(w["s"]), 3), e=round(conv(w["e"]), 3))
+                        for w in (seg.get("words") or [])]
+        out.append(seg)
+    return out
+
+
+def _hms(t):
+    """把秒格式化成 mm:ss.SSS，便于人看。"""
+    t = max(0.0, float(t))
+    m, s = divmod(t, 60)
+    return f"{int(m):02d}:{s:06.3f}"
+
+
+def report_alignment(gaps, media):
+    """打印对齐检查结果。"""
+    if gaps:
+        total = sum(g[2] for g in gaps)
+        print(f"  检测到 {len(gaps)} 处音轨断口，共缺失 {total:.2f}s：", flush=True)
+        for gs, ge, miss in gaps:
+            print(f"    · {_hms(gs)} → {_hms(ge)}  缺 {miss:.2f}s", flush=True)
+        print("    → 解码时会补静音，让 PCM 时间轴与容器/播放器时间轴一致", flush=True)
+    else:
+        print("  未发现音轨断口，时间轴正常", flush=True)
+    if media.get("duration"):
+        print(f"  容器时长 {_hms(media['duration'])}，"
+              f"音轨 {_hms(media['audio_duration'] or 0)}", flush=True)
+
+
 def extract_audio(video_path, out_path, sr=16000):
-    ffmpeg = (Path(FFMPEG_DIR) / "ffmpeg.exe") if FFMPEG_DIR else "ffmpeg"
-    run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-         "-i", str(video_path), "-vn", "-ac", "1", "-ar", str(sr),
-         "-c:a", "pcm_s16le", str(out_path)])
+    """抽音轨为 16k 单声道 WAV。
+
+    `aresample=async=1:first_pts=0` 会按 PTS 在跳空处补静音、并把起点强制对到 0，
+    这是字幕与画面同步的关键。少了它，容器里的时间空洞会被压缩，
+    导致断口之后的所有字幕提前（本片实测提前 8 秒）。
+    """
+    run([_ffmpeg_bin(), "-hide_banner", "-loglevel", "error", "-y",
+         "-i", str(video_path), "-vn",
+         "-af", "aresample=async=1:min_hard_comp=0.005:first_pts=0",
+         "-ac", "1", "-ar", str(sr), "-c:a", "pcm_s16le", str(out_path)])
     return out_path
+
+
+def verify_audio_align(wav_path, media_duration, sr=16000):
+    """校验 WAV 时长与容器时长是否一致（差值应为 0）。"""
+    try:
+        size = os.path.getsize(wav_path) - 44          # 去掉 WAV 头
+        wav_dur = size / (2 * sr)
+    except OSError:
+        return None
+    if not media_duration:
+        return wav_dur
+    diff = wav_dur - media_duration
+    ok = "OK" if abs(diff) <= 0.5 else "WARN 时间轴可能仍有偏差"
+    print(f"  校验：音频 {_hms(wav_dur)} / 容器 {_hms(media_duration)}，"
+          f"差 {diff:+.2f}s  [{ok}]", flush=True)
+    return diff
 
 
 def transcribe(audio_path, model_name="large-v3-turbo", language="fr", cpu_threads=None):
@@ -110,13 +278,13 @@ def transcribe(audio_path, model_name="large-v3-turbo", language="fr", cpu_threa
     import numpy as np
     from faster_whisper import WhisperModel
 
-    ffmpeg = (Path(FFMPEG_DIR) / "ffmpeg.exe") if FFMPEG_DIR else "ffmpeg"
     # 用 ffmpeg 解码为 float32，避免 faster-whisper 与新版 PyAV 的兼容问题
     proc = subprocess.run(
-        [str(ffmpeg), "-hide_banner", "-loglevel", "error",
+        [str(_ffmpeg_bin()), "-hide_banner", "-loglevel", "error",
          "-i", str(audio_path), "-ac", "1", "-ar", "16000", "-f", "s16le", "-"],
         capture_output=True, check=True)
     audio = np.frombuffer(proc.stdout, np.int16).astype(np.float32) / 32768.0
+
 
     if cpu_threads is None:
         cpu_threads = max(1, (os.cpu_count() or 4) - 1)
@@ -319,10 +487,24 @@ _AT = None  # 缓存的翻译器
 def _get_translators():
     global _AT
     if _AT is None:
-        os.environ["ARGOS_STANZA_AVAILABLE"] = "false"  # 禁用 stanza，纯离线
-        import argostranslate.translate as t
-        _AT = (t.get_translation_from_codes("fr", "en"),
-               t.get_translation_from_codes("en", "zh"))
+        # 分句方式决定是否会联网：
+        #   argostranslate >= 1.11 用 ARGOS_CHUNK_TYPE，MINISBD = 纯本地小模型分句
+        #   旧版用 ARGOS_STANZA_AVAILABLE=false 关掉 stanza（stanza 每次启动都会去
+        #   raw.githubusercontent.com 拉 resources.json，弱网下必失败）
+        os.environ["ARGOS_CHUNK_TYPE"] = "MINISBD"
+        os.environ["ARGOS_STANZA_AVAILABLE"] = "false"
+        try:
+            import argostranslate.translate as t
+            _AT = (t.get_translation_from_codes("fr", "en"),
+                   t.get_translation_from_codes("en", "zh"))
+        except Exception as e:
+            msg = str(e)
+            print("\n  [错误] 翻译模型加载失败。", flush=True)
+            if "SSL" in msg or "urlopen" in msg or "onnx" in msg.lower():
+                print("  原因：首次使用需要下载一个很小的分句模型（约 185KB），当前网络被拦。", flush=True)
+                print("  处理：联网后重跑一次 install.bat 预热模型，或改用自己的网络重试本命令。", flush=True)
+            print(f"  原始错误：{msg[:300]}", flush=True)
+            raise
     return _AT
 
 
@@ -395,6 +577,8 @@ def main(argv=None):
     ap.add_argument("--model", default="large-v3-turbo", help="whisper 模型名")
     ap.add_argument("--skip-download", action="store_true", help="跳过下载（用 --out 里已有的 mp4）")
     ap.add_argument("--video", default=None, help="已有视频文件路径（配合 --skip-download）")
+    ap.add_argument("--retranscribe", action="store_true", help="忽略转写缓存，重新识别")
+    ap.add_argument("--version", action="version", version=f"france2subs {__version__}")
     args = ap.parse_args(argv)
 
     out_dir = Path(args.out)
@@ -415,21 +599,62 @@ def main(argv=None):
 
     base = video.stem  # 去掉扩展名的文件名
 
+    # === 时间轴对齐检查（决定字幕能否与画面同步）===
+    print("\n[对齐] 检查音轨时间轴 ...", flush=True)
+    media = probe_media(video)
+    gaps = find_audio_gaps(video)
+    report_alignment(gaps, media)
+
     # 2. 转写（有缓存则复用）
     work = out_dir / ".france2subs_work"
     work.mkdir(exist_ok=True)
     transcript_file = work / (base + ".transcript.json")
 
-    if transcript_file.exists():
-        print(f"\n  复用已有转写缓存: {transcript_file}", flush=True)
-        rows = json.loads(transcript_file.read_text(encoding="utf-8"))["segments"]
+    cache = None
+    if transcript_file.exists() and not args.retranscribe:
+        try:
+            cache = json.loads(transcript_file.read_text(encoding="utf-8"))
+        except Exception:
+            cache = None
+
+    def _save_cache(rows, extra_note=""):
+        transcript_file.write_text(
+            json.dumps({"schema": TRANSCRIPT_SCHEMA,
+                        "duration": media.get("duration"),
+                        "audio_gaps": gaps,
+                        "segments": rows}, ensure_ascii=False, indent=1),
+            encoding="utf-8")
+        if extra_note:
+            print(f"  {extra_note}", flush=True)
+
+    if cache is not None and cache.get("schema") == TRANSCRIPT_SCHEMA:
+        print(f"\n  复用已有转写缓存（时间轴已对齐）: {transcript_file}", flush=True)
+        rows = cache["segments"]
+    elif cache is not None:
+        # 旧版缓存：v1 抽音频时没补静音，断口之后的时间戳整体偏早
+        if gaps:
+            print(f"\n  旧版转写缓存未处理音轨断口，正在按 {len(gaps)} 处断口修正时间轴"
+                  f"（无需重新识别，省 {len(cache.get('segments') or [])} 段识别耗时）", flush=True)
+            rows = remap_timeline(cache["segments"], gaps)
+        else:
+            print("\n  复用旧版转写缓存（无音轨断口，时间轴无需修正）", flush=True)
+            rows = cache["segments"]
+        _save_cache(rows, "缓存已升级到 schema 2")
     else:
         audio = work / (base + ".wav")
+        print("\n  抽取音轨 ...", flush=True)
         extract_audio(video, audio)
+        verify_audio_align(audio, media.get("duration"))
         rows = transcribe(audio, args.model)
-        transcript_file.write_text(
-            json.dumps({"duration": None, "segments": rows}, ensure_ascii=False, indent=1),
-            encoding="utf-8")
+        _save_cache(rows)
+
+    # 时间轴健全性检查：最后一句不应超出视频长度
+    if rows and media.get("duration"):
+        last = max(r["end"] for r in rows)
+        mark = "OK" if last <= media["duration"] + 1.0 else "WARN 超出视频长度"
+        print(f"  [对齐] 识别结果覆盖到 {_hms(last)} / 视频 {_hms(media['duration'])}  [{mark}]",
+              flush=True)
+
 
     # 3. 排版
     cues = finalize(build_cues(rows))

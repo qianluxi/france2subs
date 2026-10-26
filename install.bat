@@ -3,18 +3,22 @@ chcp 65001 >nul
 setlocal enabledelayedexpansion
 
 echo ============================================
-echo   france2subs - install
+echo   france2subs - installer
 echo ============================================
 echo.
 
 REM ---------- 1. locate Python ----------
 where python >nul 2>nul
 if errorlevel 1 (
-    echo [ERROR] Python not found. Please install Python 3.9+ and check "Add to PATH".
-    echo         https://www.python.org/downloads/
+    echo [ERROR] Python not found.
+    echo         Install Python 3.9+ from https://www.python.org/downloads/
+    echo         and tick "Add Python to PATH" during setup.
     pause
     exit /b 1
 )
+for /f "delims=" %%v in ('python -c "import sys;print(sys.version.split()[0])"') do set PYVER=%%v
+echo Python found: %PYVER%
+echo.
 
 echo [1/3] Installing packages ...
 python -m pip install --upgrade pip
@@ -35,16 +39,20 @@ if errorlevel 1 (
 )
 
 echo.
-echo [3/3] Pre-downloading translation models ...
-python -c "import argostranslate.package as pkg, argostranslate.translate as tr; [x.download() for x in pkg.get_available_packages() if (x.from_code=='fr' and x.to_code=='en') or (x.from_code=='en' and x.to_code=='zh')]; print('done')"
-if errorlevel 1 (
-    echo [WARN] model download failed, will retry on first run.
+echo [3/3] Pre-downloading models ...
+set DOWNLOAD_WHISPER=Y
+set /p DOWNLOAD_WHISPER=Download speech model now? about 1.5 GB [Y/n]:
+if /i "%DOWNLOAD_WHISPER%"=="n" (
+    python install_warmup.py --no-whisper
+) else (
+    python install_warmup.py
 )
 
 echo.
 echo ============================================
 echo   Install done.
-echo   GUI:      python app.py
-echo   CLI:      python france2subs.py "URL"
+echo.
+echo   GUI:  python app.py
+echo   CLI:  python france2subs.py "URL"
 echo ============================================
 pause
