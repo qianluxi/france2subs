@@ -59,11 +59,24 @@ v1.1.0 的处理方式：
 
 ### 图形界面（推荐）
 
+**双击 `start.bat`** 即可打开界面。
+
+粘贴 france.tv 网址 → 选字幕类型和画质 → 点「开始」→ 等进度条走完。
+
+> `start.bat` 会自动挑一个「既装了依赖、又带 tkinter」的 Python 来启动。
+> 如果机器上有多个 Python（比如官方版和工作区自带的精简版并存），它会逐个体检并选对的那个；
+> 只有 tkinter 缺依赖时，会问你要不要顺手装上。
+
+也可以用命令行启动：
+
 ```
 python app.py
 ```
 
-粘贴 france.tv 网址 → 选字幕类型和画质 → 点「开始」→ 等进度条走完。
+启动器有两个调试参数（一般用不到）：
+
+- `start.bat --check` — 只体检环境，不启动界面
+- `start.bat --console` — 保留控制台窗口运行，方便看报错
 
 ### 命令行
 
@@ -91,6 +104,14 @@ python france2subs.py "任意占位" --skip-download --video "我的视频.mp4" 
 
 ## 常见问题
 
+**Q：双击 start.bat 没反应 / 闪一下就没了？**
+它会把检查结果打在窗口里。若窗口一闪而过，在地址栏输入 `cmd` 打开命令行，执行 `start.bat` 看完整输出；
+或直接执行 `start.bat --check` 只做环境体检。
+
+**Q：提示「现有 Python 都没有 tkinter」？**
+说明你的 Python 是精简版或商店版。装官方 Python（python.org）后重跑 `install.bat` 即可。
+只想用命令行版的话，`python france2subs.py "网址"` 不需要 tkinter。
+
 **Q：转写很慢？**
 正常。语音识别在本机 CPU 上跑，26 分钟的视频约需 5~10 分钟（视 CPU 而定）。
 
@@ -113,7 +134,9 @@ france.tv 的部分内容有地区限制（仅法国 IP 可看）。若下载失
 
 ```
 france2subs/
+├── start.bat         双击启动图形界面
 ├── france2subs.py    核心引擎（下载/对齐/转写/排版/翻译）
+├── launch.py         启动器（挑解释器 + 检查依赖 + 拉起界面）
 ├── app.py            图形界面
 ├── install.bat       一键安装脚本
 ├── install_warmup.py 模型预下载（安装脚本会调用）

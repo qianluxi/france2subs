@@ -52,7 +52,7 @@ echo.
 echo ============================================
 echo   Install done.
 echo.
-echo   GUI:  python app.py
-echo   CLI:  python france2subs.py "URL"
+echo   Start GUI :  double-click start.bat
+echo   Command   :  python france2subs.py "URL"
 echo ============================================
 pause
