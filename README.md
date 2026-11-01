@@ -127,8 +127,22 @@ v1.1.0 已修复，原因是音轨时间戳断口被压缩。如果你用的是�
 **Q：提示找不到 ffmpeg？**
 重新运行 `install.bat`；它已把 ffmpeg 备好，脚本会自动定位。
 
-**Q：下载报错？**
-france.tv 的部分内容有地区限制（仅法国 IP 可看）。若下载失败，通常是该视频在你的网络区域不可用。
+**Q：下载报错 / 下到一半停了？**
+先看日志：`<输出目录>\.france2subs_work\france2subs.log`（GUI 里也会实时显示这些内容）。
+
+最常见的两个原因：
+
+1. **缺 `pycryptodomex`。** france.tv 的流是 AES-128 加密的，没有这个库时 yt-dlp 会把整条下载交给 ffmpeg，日志里会出现
+   `The stream has AES-128 encryption and pycryptodomex is not available; extraction will be delegated to ffmpeg`。
+   这种方式**没有分片重试、没有断点续传**，网络一抖整条就废，还会留下 `.part-Frag217.part` 之类的残片。
+   修复：`python -m pip install pycryptodomex`（v1.1.1 起会自动尝试安装并检测）。
+2. **地区限制。** 部分内容仅法国 IP 可看。
+
+现在重跑同一条命令就会**从断点续传**，不会从头下载。成功后的残留临时文件会自动清理。
+
+**Q：怎么确认下载的文件是完整的？**
+v1.1.1 起每次下载完都会校验：文件大小、是否同时含视频流和音频流、时长是否合理。
+不通过会自动重试（默认 3 次），仍失败则明确报错，不会拿半截文件去做字幕。
 
 ## 文件结构
 

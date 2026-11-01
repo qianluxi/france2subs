@@ -3,6 +3,9 @@
 # 或直接运行 install.bat（Windows 一键安装）
 
 yt-dlp>=2024.1.0
+# HLS 的 AES-128 解密：缺它 yt-dlp 会把整条下载甩给 ffmpeg，
+# 没有分片重试/断点续传，网络抖动就会整个失败。必须有。
+pycryptodomex>=3.20
 faster-whisper>=1.0.0
 argostranslate>=1.9.0
 static-ffmpeg>=3.0

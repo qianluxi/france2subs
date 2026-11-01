@@ -29,7 +29,7 @@ import sys
 import time
 from pathlib import Path
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 TRANSCRIPT_SCHEMA = 2   # 2 = 已处理音轨断口（见「时间轴对齐」一节）
 
 # ----------------------------------------------------------------------------
@@ -57,43 +57,304 @@ def run(cmd, **kw):
 
 
 # ----------------------------------------------------------------------------
+# 日志：同时写控制台与文件
+# ----------------------------------------------------------------------------
+
+LOG_PATH = None
+_LOG_FH = None
+_ORIG_OUT = sys.stdout
+_ORIG_ERR = sys.stderr
+DEBUG = False
+
+
+class _Tee:
+    """把写入同时转发到原始流和日志文件，用来兜住所有 print 与异常回溯。"""
+
+    def __init__(self, stream, fh):
+        self._stream = stream
+        self._fh = fh
+
+    def write(self, s):
+        try:
+            self._stream.write(s)
+        except Exception:
+            pass
+        try:
+            self._fh.write(s)
+            self._fh.flush()
+        except Exception:
+            pass
+        return len(s)
+
+    def flush(self):
+        for x in (self._stream, self._fh):
+            try:
+                x.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        try:
+            return self._stream.isatty()
+        except Exception:
+            return False
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def setup_log(out_dir, debug=False):
+    """把全部输出同时写进 <out>/.france2subs_work/france2subs.log，便于事后排查。"""
+    global LOG_PATH, _LOG_FH, DEBUG
+    DEBUG = debug
+    try:
+        work = Path(out_dir) / ".france2subs_work"
+        work.mkdir(parents=True, exist_ok=True)
+        LOG_PATH = work / "france2subs.log"
+        _LOG_FH = open(LOG_PATH, "a", encoding="utf-8")
+        sys.stdout = _Tee(_ORIG_OUT, _LOG_FH)
+        sys.stderr = _Tee(_ORIG_ERR, _LOG_FH)
+        log(f"===== {time.strftime('%Y-%m-%d %H:%M:%S')}  france2subs {__version__} =====")
+        log(f"  日志文件：{LOG_PATH}")
+    except Exception:
+        LOG_PATH = None
+    return LOG_PATH
+
+
+def log(msg, console=True):
+    """写一行带时间戳的日志。console=False 时只进文件（用于 yt-dlp 的碎行）。"""
+    line = str(msg)
+    if console:
+        try:
+            _ORIG_OUT.write(line + "\n")
+            _ORIG_OUT.flush()
+        except Exception:
+            pass
+    if _LOG_FH:
+        try:
+            _LOG_FH.write(f"[{time.strftime('%H:%M:%S')}] {line}\n")
+            _LOG_FH.flush()
+        except Exception:
+            pass
+
+
+# ----------------------------------------------------------------------------
 # 步骤 1：下载视频
 # ----------------------------------------------------------------------------
 
-def download_video(url, out_dir, max_height=1080):
-    print("\n[1/4] 下载视频 ...", flush=True)
+def ensure_hls_decrypt():
+    """检查 AES-128 解密库。
+
+    france.tv 的 HLS 全是 AES-128 加密。没有 pycryptodomex 时 yt-dlp 只能把
+    整条流交给外部 ffmpeg（日志里会出现 "extraction will be delegated to ffmpeg"），
+    而 ffmpeg 单进程拉 HLS 没有分片级重试、没有断点续传，
+    网络一抖就整条失败、只留下 .part-FragNNN.part 残片。
+    """
+    import importlib
+
+    def ok():
+        try:
+            importlib.invalidate_caches()
+            import Cryptodome  # noqa: F401
+            return True
+        except Exception:
+            return False
+
+    if ok():
+        return True
+
+    log("  未检测到 pycryptodomex，正在尝试自动安装 ...")
+    cmds = [
+        [sys.executable, "-m", "pip", "install", "-q", "pycryptodomex"],
+        [sys.executable, "-m", "pip", "install", "-q", "pycryptodomex",
+         "-i", "https://pypi.tuna.tsinghua.edu.cn/simple"],
+    ]
+    for c in cmds:
+        try:
+            subprocess.run(c, check=True, timeout=240,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            log(f"  安装尝试失败：{e}")
+            continue
+        if ok():
+            log("  pycryptodomex 安装成功（启用分片重试与断点续传）")
+            return True
+
+    log("  [警告] 仍缺少 pycryptodomex，下载将由 ffmpeg 代劳：")
+    log("         这种方式没有分片重试、没有断点续传，网络抖动时容易整体失败。")
+    log("         修复：python -m pip install pycryptodomex")
+    return False
+
+
+class _YdlLogger:
+    """把 yt-dlp 的日志接进我们的日志文件（进度另有 progress_hook，这里过滤掉刷屏行）。"""
+
+    _NOISE = ("[debug] ", "[download] ")
+
+    def debug(self, msg):
+        s = str(msg).strip()
+        if s.startswith(self._NOISE):
+            return                      # 进度行交给 progress_hook，避免日志被刷爆
+        log("[yt-dlp] " + s, console=DEBUG)
+
+    def info(self, msg):
+        log("[yt-dlp] " + str(msg).strip(), console=False)
+
+    def warning(self, msg):
+        log("  [yt-dlp 警告] " + str(msg).strip())
+
+    def error(self, msg):
+        log("  [yt-dlp 错误] " + str(msg).strip())
+
+
+def _make_progress_hook():
+    state = {"pct": -10.0, "t": 0.0}
+
+    def hook(d):
+        if d.get("status") != "downloading":
+            return
+        now = time.time()
+        total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+        done = d.get("downloaded_bytes") or 0
+        pct = (done * 100.0 / total) if total else 0.0
+        # 每 10% 或每 30 秒记一次，避免日志被刷爆
+        if pct - state["pct"] < 10 and now - state["t"] < 30:
+            return
+        state["pct"], state["t"] = pct, now
+        speed = d.get("speed") or 0
+        eta = d.get("eta") or 0
+        frag = ""
+        if d.get("fragment_index") is not None:
+            frag = f"  分片 {d.get('fragment_index')}/{d.get('fragment_count') or '?'}"
+        log(f"  下载中 {pct:5.1f}%  {done/1048576:.0f}/{total/1048576:.0f} MB  "
+            f"{speed/1048576:.2f} MB/s  剩 {eta/60:.0f} 分{frag}")
+
+    return hook
+
+
+def _probe_streams(path):
+    """返回 (是否含视频流, 是否含音频流, 时长秒)；读不到返回 (False, False, None)。"""
+    try:
+        p = subprocess.run(
+            [str(_ffprobe_bin()), "-v", "error",
+             "-show_entries", "format=duration:stream=codec_type",
+             "-of", "json", str(path)],
+            capture_output=True, text=True, check=True)
+        d = json.loads(p.stdout or "{}")
+        kinds = [s.get("codec_type") for s in (d.get("streams") or [])]
+        dur = (d.get("format") or {}).get("duration")
+        dur = float(dur) if dur not in (None, "N/A") else None
+        return ("video" in kinds, "audio" in kinds, dur)
+    except Exception:
+        return (False, False, None)
+
+
+def verify_video(path, expect_min_seconds=60):
+    """校验下载成品：文件够大、音视频流齐全、时长合理。"""
+    path = Path(path)
+    if not path.exists():
+        return False, "文件不存在"
+    mb = path.stat().st_size / 1048576
+    if mb < 20:
+        return False, f"文件过小（{mb:.1f} MB），应是没下完整"
+    has_v, has_a, dur = _probe_streams(path)
+    if not has_v:
+        return False, "缺少视频流"
+    if not has_a:
+        return False, "缺少音频流（只下到视频轨，未完成合并）"
+    if dur is not None and dur < expect_min_seconds:
+        return False, f"时长仅 {dur:.0f} 秒，明显不完整"
+    return True, f"{mb:.0f} MB / {dur:.0f}s" if dur else f"{mb:.0f} MB"
+
+
+def cleanup_orphans(out_dir):
+    """清掉下载成功后的残留分片/临时文件。"""
+    n = 0
+    for pat in ("*.part", "*.part-Frag*", "*.ytdl", "*.temp"):
+        for f in Path(out_dir).glob(pat):
+            try:
+                f.unlink()
+                n += 1
+            except Exception:
+                pass
+    if n:
+        log(f"  已清理 {n} 个残留临时文件")
+
+
+def download_video(url, out_dir, max_height=1080, attempts=3):
+    log("\n[1/4] 下载视频 ...")
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     import yt_dlp
+
+    has_decrypt = ensure_hls_decrypt()
 
     opts = {
         "outtmpl": str(out_dir / "%(title)s [%(id)s].%(ext)s"),
         "format": f"bestvideo[height<={max_height}]+bestaudio/best",
         "merge_output_format": "mp4",
         "noplaylist": True,
-        "quiet": False,
+        "quiet": True,
         "no_warnings": False,
+        "logger": _YdlLogger(),
+        "progress_hooks": [_make_progress_hook()],
+        # ---- 抗网络抖动 ----
+        "retries": 20,                      # 普通 HTTP 请求
+        "fragment_retries": 30,             # 单个 HLS 分片（缺解密库时此项无效）
+        "concurrent_fragment_downloads": 4 if has_decrypt else 1,
+        "socket_timeout": 30,               # 默认 20 秒，放宽避免慢 CDN 被误杀
+        "continuedl": True,                 # 断点续传，重试时不从头开始
+        "overwrites": False,
+        "nopart": False,                    # 保留 .part 才能在中断后接着下
+        "hls_prefer_native": has_decrypt,
+        "retry_sleep_functions": {
+            "http": lambda n: min(2 ** n, 30),
+            "fragment": lambda n: min(2 ** n, 30),
+            "file_access": lambda n: 0,
+        },
     }
+    if DEBUG:
+        opts["verbose"] = True
     if FFMPEG_DIR:
         opts["ffmpeg_location"] = FFMPEG_DIR
 
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        if "entries" in info:
-            info = info["entries"][0]
-        filename = ydl.prepare_filename(info)
-        # 合并后扩展名统一为 .mp4
-        filename = re.sub(r"\.(webm|mkv|mp4|m4a)$", ".mp4", filename)
+    last_err = None
+    for i in range(1, attempts + 1):
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                if info and "entries" in info:
+                    info = info["entries"][0]
+                filename = ydl.prepare_filename(info)
+            filename = re.sub(r"\.(webm|mkv|mp4|m4a)$", ".mp4", filename)
 
-    path = Path(filename)
-    if not path.exists():
-        # 某些情况文件名带格式后缀，做一次兜底查找
-        cands = list(out_dir.glob(path.stem + ".*"))
-        if cands:
-            path = cands[0]
-    print(f"  已下载: {path}", flush=True)
-    return path
+            path = Path(filename)
+            if not path.exists():
+                cands = [c for c in out_dir.glob(path.stem + ".*")
+                         if c.suffix in (".mp4", ".mkv", ".webm")]
+                if cands:
+                    path = cands[0]
+
+            good, why = verify_video(path)
+            if good:
+                log(f"  已下载: {path.name}  ({why})")
+                cleanup_orphans(out_dir)
+                return path
+            last_err = why
+            log(f"  [校验未通过] {why}")
+
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            log(f"  [第 {i}/{attempts} 次下载失败] {last_err}")
+
+        if i < attempts:
+            log("  8 秒后重试（已下好的分片会复用，不会从头再来）...")
+            time.sleep(8)
+
+    raise RuntimeError(
+        f"下载失败（已重试 {attempts} 次）：{last_err}\n"
+        f"  详细日志：{LOG_PATH}")
 
 
 # ----------------------------------------------------------------------------
@@ -578,11 +839,13 @@ def main(argv=None):
     ap.add_argument("--skip-download", action="store_true", help="跳过下载（用 --out 里已有的 mp4）")
     ap.add_argument("--video", default=None, help="已有视频文件路径（配合 --skip-download）")
     ap.add_argument("--retranscribe", action="store_true", help="忽略转写缓存，重新识别")
+    ap.add_argument("--debug", action="store_true", help="输出 yt-dlp 详细调试日志")
     ap.add_argument("--version", action="version", version=f"france2subs {__version__}")
     args = ap.parse_args(argv)
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
+    setup_log(out_dir, args.debug)
 
     # 1. 下载
     if args.skip_download:
@@ -595,7 +858,13 @@ def main(argv=None):
         else:
             video = Path(args.video)
     else:
-        video = download_video(args.url, out_dir, args.max_height)
+        try:
+            video = download_video(args.url, out_dir, args.max_height)
+        except RuntimeError as e:
+            log(f"\n[失败] {e}")
+            log("  常见原因：网络中断、站点限流、视频有地区限制（需法国 IP）。")
+            log("  重新运行同一条命令即可续传，已下载的分片不会浪费。")
+            return 1
 
     base = video.stem  # 去掉扩展名的文件名
 

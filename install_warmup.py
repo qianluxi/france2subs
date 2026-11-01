@@ -92,11 +92,43 @@ def warmup_whisper(model_name="large-v3-turbo"):
         return False
 
 
+def check_decrypt():
+    """france.tv 的 HLS 是 AES-128 加密，缺 pycryptodomex 会导致下载易中断。"""
+    log("[检查] HLS 解密库 pycryptodomex ...")
+    try:
+        import Cryptodome  # noqa: F401
+        log("  [已装] 下载走原生分片器（支持分片重试与断点续传）")
+        return True
+    except ImportError:
+        pass
+
+    log("  未安装，正在安装 ...")
+    import subprocess
+    for extra in ([], ["-i", "https://pypi.tuna.tsinghua.edu.cn/simple"]):
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "pycryptodomex"] + extra,
+                           check=True, timeout=240)
+        except Exception as e:
+            log(f"  [警告] 安装失败：{str(e)[:120]}")
+            continue
+        try:
+            import Cryptodome  # noqa: F401
+            log("  [完成] pycryptodomex 已就绪")
+            return True
+        except ImportError:
+            continue
+
+    log("  [警告] 缺 pycryptodomex：下载会交给 ffmpeg，无法分片重试/续传，")
+    log("         长视频容易中途失败。请手动执行：python -m pip install pycryptodomex")
+    return False
+
+
 def main(argv):
     skip_whisper = "--no-whisper" in argv
     log("=" * 46)
     log("  france2subs 预下载")
     log("=" * 46)
+    check_decrypt()
     install_translation_packages()
     warmup_sbd()
     if skip_whisper:
