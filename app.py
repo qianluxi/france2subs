@@ -76,6 +76,12 @@ class App:
                              state="readonly", values=["1080p", "720p", "540p", "360p"])
         h_box.pack(side="left", padx=(4, 16))
 
+        ttk.Label(opt_frame, text="翻译：").pack(side="left")
+        self.trans_var = tk.StringVar(value="自动")
+        t_box = ttk.Combobox(opt_frame, textvariable=self.trans_var, width=9,
+                             state="readonly", values=["自动", "在线优先", "纯离线"])
+        t_box.pack(side="left", padx=(4, 16))
+
         ttk.Label(opt_frame, text="保存到：").pack(side="left")
         self.out_var = tk.StringVar(value=str(HERE.parent))
         out_entry = ttk.Entry(opt_frame, textvariable=self.out_var, width=30)
@@ -128,6 +134,8 @@ class App:
         height_map = {"1080p": 1080, "720p": 720, "540p": 540, "360p": 360}
         sub = sub_map.get(self.sub_var.get(), "bilingual")
         h = height_map.get(self.height_var.get(), 1080)
+        trans = {"自动": "auto", "在线优先": "online", "纯离线": "offline"}.get(
+            self.trans_var.get(), "auto")
         out = self.out_var.get().strip() or str(HERE.parent)
 
         self.start_btn.configure(state="disabled")
@@ -137,7 +145,8 @@ class App:
         self._clear_log()
 
         cmd = [sys.executable, str(ENGINE), url,
-               "--subtitle", sub, "--max-height", str(h), "--out", out]
+               "--subtitle", sub, "--max-height", str(h), "--out", out,
+               "--translator", trans]
 
         self.proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,

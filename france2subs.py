@@ -20,6 +20,7 @@ france2subs —— 下载 france.tv 视频并自动生成法语/中法双语字�
 之后离线可用。
 """
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -27,9 +28,10 @@ import statistics
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 TRANSCRIPT_SCHEMA = 2   # 2 = 已处理音轨断口（见「时间轴对齐」一节）
 
 # ----------------------------------------------------------------------------
@@ -739,10 +741,17 @@ def _write_txt(cues, path):
 
 
 # ----------------------------------------------------------------------------
-# 步骤 4：翻译（Argos Translate，法→英→中，纯离线）
+# 步骤 4：翻译
+#   两套引擎，结果完全一致地落成 zh / bilingual 字幕：
+#     online  —— MyMemory 免费接口，法→中直译，专有名词和说法明显更准
+#                （"capitale gastronomique" 是「美食之都」，不是「胃病的首都」）
+#     offline —— Argos Translate，法→英→中两跳，纯离线，弱网也能出结果
+#   auto（默认）：先走在线，遇到配额用尽/网络不通就自动回落离线，保证一定有输出。
 # ----------------------------------------------------------------------------
 
-_AT = None  # 缓存的翻译器
+ONLINE_API = "https://api.mymemory.translated.net/get"
+_AT = None              # 缓存的离线翻译器
+_QUOTA_DEAD = False     # 本次进程内在线配额是否已耗尽
 
 
 def _get_translators():
@@ -786,18 +795,232 @@ def _clean_zh(s):
     return s
 
 
-def translate_cues(cues):
-    print("\n[3/4] 翻译成中文（法→英→中，离线） ...", flush=True)
-    fr2en, en2zh = _get_translators()
+def _has_cjk(s):
+    return bool(re.search(r"[\u4e00-\u9fff]", s or ""))
+
+
+def _cue_key(fr):
+    return hashlib.sha1(fr.strip().encode("utf-8")).hexdigest()[:16]
+
+
+class _QuotaOut(Exception):
+    """在线翻译配额用尽（不是网络错误，重试也没用）。"""
+
+
+def _http_json(url, text):
+    import urllib.parse
+    import urllib.request
+    full = url + ("&" if "?" in url else "?") + urllib.parse.urlencode(
+        {"q": text, "langpair": "fr|zh-CN"})
+    req = urllib.request.Request(full, headers={"User-Agent": f"france2subs/{__version__}"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def _online_one(text, retries=3):
+    """单句在线翻译。配额用尽抛 _QuotaOut；没译出来返回 None。"""
+    global _QUOTA_DEAD
+    for i in range(retries):
+        if _QUOTA_DEAD:
+            return None
+        try:
+            j = _http_json(ONLINE_API, text)
+        except Exception:
+            time.sleep(1.0 + i)
+            continue
+        status = str(j.get("responseStatus", ""))
+        detail = str(j.get("responseDetails") or "")
+        zh = str((j.get("responseData") or {}).get("translatedText") or "").strip()
+        blob = (detail + " " + zh).upper()
+        if "MYMEMORY WARNING" in blob or "QUOTA" in blob or "AVAILABLE FREE" in blob:
+            _QUOTA_DEAD = True
+            return None
+        if status == "200" and zh and zh.lower() != text.strip().lower() and _has_cjk(zh):
+            return zh
+        if status in ("429", "403", "500", "503"):
+            time.sleep(1.5 + i * 2)
+            continue
+        return None
+    return None
+
+
+def _blocks(cues):
+    """把连续的 cue 合并成翻译块。
+
+    单条 cue 往往只是半句话（"de produits" / "locaux."），逐条机器翻译必然走偏。
+    块内用换行连接，接口会原样保留换行，译后按行拆回，条数不变、时间轴不动。
+    """
+    out, cur, nchars = [], [], 0
+    for idx, (_, _, fr) in enumerate(cues):
+        t = (fr or "").strip()
+        if not t:
+            if cur:
+                out.append(cur)
+                cur, nchars = [], 0
+            continue
+        cur.append(idx)
+        nchars += len(t)
+        ends = bool(re.search(r"[.!?…]\s*$", t))
+        if (ends and nchars >= 40) or len(cur) >= 4 or nchars >= 240:
+            out.append(cur)
+            cur, nchars = [], 0
+    if cur:
+        out.append(cur)
+    return out
+
+
+def _plausible(fr, zh):
+    """挡住机器翻译的离谱输出（超长公司名、空译、原文回吐）。"""
+    if not zh or not _has_cjk(zh):
+        return False
+    if zh.strip().lower() == (fr or "").strip().lower():
+        return False
+    cjk = len(re.findall(r"[\u4e00-\u9fff]", zh))
+    ratio = cjk / max(len(fr), 1)
+    return 0.15 <= ratio <= 1.8
+
+
+def _strip_latin_gloss(s):
+    """去掉「里尔（ Lille ）」这种夹注——字幕里读起来很吵。"""
+    if not _has_cjk(s):
+        return s
+    s = re.sub(r"[（(]\s*[A-Za-zÀ-ÿ'’\-.\s]{2,40}[）)]", "", s)
+    return re.sub(r"\s{2,}", " ", s).strip()
+
+
+_ZH_STRONG = set("，。！？、；：…,.!?;: ")
+_ZH_WEAK = set("的了着地得在和与或及而但就都很更最不没把被从对给让使以为成到过于是其之也还又却")
+
+
+def _best_cut(zh, target, lo, hi, window=7):
+    """在 target 附近找最自然的断句点：优先标点，其次中文虚词边界。"""
+    for d in range(0, window):
+        for cand in (target - d, target + d):
+            if lo < cand < hi and zh[cand - 1] in _ZH_STRONG:
+                return cand
+    for d in range(0, window):
+        for cand in (target - d, target + d):
+            if lo < cand < hi and (zh[cand - 1] in _ZH_WEAK or zh[cand] in _ZH_WEAK):
+                return cand
+    return None
+
+
+def _split_zh(zh, weights):
+    """把整段中文按各条字幕的法文长度占比拆回去，切点尽量落在标点或虚词边界。"""
+    zh = (zh or "").strip()
+    n = len(weights)
+    if n <= 1 or not zh:
+        return [zh]
+    total = sum(weights) or 1
+    parts, prev, acc = [], 0, 0
+    for k, w in enumerate(weights[:-1]):
+        acc += w
+        target = round(len(zh) * acc / total)
+        room = n - k - 1                       # 后面每条至少留 1 字
+        hi = max(prev + 2, len(zh) - room)
+        cut = _best_cut(zh, target, prev, hi) or min(max(target, prev + 1), hi)
+        parts.append(zh[prev:cut].strip(" ，。、；：…,.!?;:"))
+        prev = cut
+    parts.append(zh[prev:].strip(" ，。、；：…,.!?;:"))
+    return parts
+
+
+def _translate_online(cues, cache, cache_path, workers=6):
+    """块级在线翻译，行级缓存。返回 {原文: 中文}。"""
+    global _QUOTA_DEAD
+    blocks = _blocks(cues)
+    todo = []
+    for blk in blocks:
+        if any(_cue_key(cues[i][2]) not in cache for i in blk):
+            todo.append(blk)
+    if not todo:
+        print(f"  在线译文全部命中缓存（{len(cues)} 条）", flush=True)
+        return {cues[i][2]: cache[_cue_key(cues[i][2])] for i in range(len(cues))
+                if _cue_key(cues[i][2]) in cache}
+    if _QUOTA_DEAD:
+        return {cues[i][2]: cache[_cue_key(cues[i][2])] for i in range(len(cues))
+                if _cue_key(cues[i][2]) in cache}
+
+    print(f"  在线翻译 {len(todo)} 个句块 / {len(cues)} 条字幕"
+          f"（缓存命中 {len(cues) - sum(len(b) for b in todo)} 条）...", flush=True)
+    ok = 0
+    t0 = time.time()
+
+    def work(blk):
+        text = " ".join((cues[i][2] or "").strip() for i in blk)
+        return blk, text, _online_one(text)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for i, (blk, text, zh) in enumerate(pool.map(work, todo), 1):
+            zh = _strip_latin_gloss(zh or "")
+            if zh and _plausible(text, zh):
+                weights = [max(len((cues[i2][2] or "").strip()), 4) for i2 in blk]
+                for idx, p in zip(blk, _split_zh(zh, weights)):
+                    if p:
+                        cache[_cue_key(cues[idx][2])] = p
+                        ok += 1
+            if i % 20 == 0 or i == len(todo):
+                el = time.time() - t0
+                print(f"    块 {i}/{len(todo)}  已译 {ok} 条  用时 {el/60:.1f} 分", flush=True)
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                cache_path.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+            if _QUOTA_DEAD:
+                break
+            time.sleep(0.05)
+    if ok:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+    if _QUOTA_DEAD:
+        print("  ! 在线配额已用尽，剩余句子自动改走离线引擎", flush=True)
+    return {cues[i][2]: cache[_cue_key(cues[i][2])] for i in range(len(cues))
+            if _cue_key(cues[i][2]) in cache}
+
+
+
+def translate_cues(cues, engine="auto", work=None):
+    """cues: [(start, end, fr)] → [[start, end, fr, zh]]"""
+    work = Path(work) if work else Path.cwd() / ".france2subs_work"
+    cache_path = work / "zh_online.json"
+    cache = {}
+    if cache_path.exists():
+        try:
+            cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        except Exception:
+            cache = {}
+
+    hits = {}
+    if engine in ("auto", "online"):
+        print("\n[3/4] 翻译成中文（在线整句翻译，质量优先） ...", flush=True)
+        try:
+            hits = _translate_online(cues, cache, cache_path)
+        except Exception as e:
+            print(f"  在线翻译异常（{str(e)[:80]}），改走离线引擎", flush=True)
+            hits = {}
+
     out = []
     n = len(cues)
+    need_offline = any(fr.strip() and fr not in hits for _, _, fr in cues)
+    fr2en = en2zh = None
+    if need_offline:
+        if engine == "online":
+            print("  部分句子在线未译出，离线补齐 ...", flush=True)
+        elif hits:
+            print(f"  {sum(1 for _,_,fr in cues if fr.strip() and fr not in hits)} 条在线未覆盖，离线补齐 ...",
+                  flush=True)
+        print("\n[3/4] 离线翻译引擎（法→英→中） ...", flush=True)
+        fr2en, en2zh = _get_translators()
+
     for i, (s, e, fr) in enumerate(cues):
-        mid = fr2en.translate(fr)
-        zh = _clean_zh(en2zh.translate(mid))
+        zh = hits.get(fr)
+        if zh:
+            zh = _clean_zh(zh)
+        else:
+            zh = _clean_zh(en2zh.translate(fr2en.translate(fr))) if fr2en else ""
         out.append([s, e, fr, zh])
-        if i % 50 == 0:
+        if i % 100 == 0 and (i or n):
             print(f"  进度 {i+1}/{n}", flush=True)
-    print(f"  完成 {n} 条", flush=True)
+    n_online = sum(1 for r in out if hits.get(r[2]))
+    print(f"  完成 {n} 条（在线 {n_online} 条 / 离线 {n - n_online} 条）", flush=True)
     return out
 
 
@@ -836,6 +1059,8 @@ def main(argv=None):
     ap.add_argument("--max-height", type=int, default=1080, help="视频最大高度")
     ap.add_argument("--out", default=".", help="输出目录")
     ap.add_argument("--model", default="large-v3-turbo", help="whisper 模型名")
+    ap.add_argument("--translator", choices=["auto", "online", "offline"], default="auto",
+                    help="翻译引擎：auto=优先在线、失败回落离线（默认）/ online=只走在线 / offline=纯离线")
     ap.add_argument("--skip-download", action="store_true", help="跳过下载（用 --out 里已有的 mp4）")
     ap.add_argument("--video", default=None, help="已有视频文件路径（配合 --skip-download）")
     ap.add_argument("--retranscribe", action="store_true", help="忽略转写缓存，重新识别")
@@ -939,7 +1164,7 @@ def main(argv=None):
 
     # 5. 翻译 + 双语
     if args.subtitle in ("zh", "bilingual", "all"):
-        translated = translate_cues(cues)
+        translated = translate_cues(cues, args.translator, work)
 
         zh_cues = [[s, e, zh] for s, e, fr, zh in translated]
         zh_srt = out_dir / (base + ".zh.srt")
